@@ -13,9 +13,12 @@
 #define LOC_BW 5000.0
 #define SM60_NVLINK_BW 18.0
 #define SM70_NVLINK_BW 20.0
+// a100 sm80
 #define SM80_NVLINK_BW 20.0
 #define SM90_NVLINK_BW 20.0
+// 3080ti, 3090 sm86
 #define SM86_NVLINK_BW 12.0
+// 评委讲PCIe 4.0 x16 64GB/s
 #define PCI_BW 12.0           // PCI Gen3 x16
 #define QPI_BW 6.0
 #define SKL_QPI_BW 10.0
@@ -23,6 +26,7 @@
 #define YONGFENG_ZPI_BW 9.0
 #define P9_BW 32.0
 #define ARM_BW 6.0
+// 评委说CX-6网卡有 25GB/s, 我们自己的供货单上写着100Gbit/s, 倒是和下边匹配了。
 #define NET_BW 12.0           // 100Gbit
 
 // Intel CPU convert GPU P2P traffic into 64B PCI TLPs, so GPU
@@ -56,6 +60,7 @@ extern const char* topoLinkTypeStr[];
 // Connection traversing NVLink
 #define PATH_NVL 1
 
+// 进一步对“P2P代理的解释”
 // Connection through NVLink using an intermediate GPU
 #define PATH_NVB 2
 
@@ -91,7 +96,7 @@ struct ncclTopoLink {
 #define NCCL_TOPO_MAX_HOPS (NCCL_TOPO_MAX_NODES*NCCL_TOPO_NODE_TYPES)
 
 struct ncclTopoLinkList {
-  struct ncclTopoLink* list[NCCL_TOPO_MAX_HOPS];
+  struct ncclTopoLink* list[NCCL_TOPO_MAX_HOPS]; // NCCL_TOPO_MAX_HOPS = 256*7 (NCCL_TOPO_MAX_NODES * NCCL_TOPO_NODE_TYPES)
   int count;
   float bw;
   int type;
@@ -134,19 +139,21 @@ struct ncclTopoNode {
   };
   int nlinks;
   struct ncclTopoLink links[NCCL_TOPO_MAX_LINKS];
+
   // Pre-computed paths to GPUs and NICs
-  struct ncclTopoLinkList* paths[NCCL_TOPO_NODE_TYPES];
+  struct ncclTopoLinkList* paths[NCCL_TOPO_NODE_TYPES]; // NCCL_TOPO_NODE_TYPES=7
+
   // Used during search
   uint64_t used;
 };
 
 struct ncclTopoNodeSet {
   int count;
-  struct ncclTopoNode nodes[NCCL_TOPO_MAX_NODES];
+  struct ncclTopoNode nodes[NCCL_TOPO_MAX_NODES]; // NCCL_TOPO_MAX_NODES=256
 };
 
 struct ncclTopoSystem {
-  struct ncclTopoNodeSet nodes[NCCL_TOPO_NODE_TYPES];
+  struct ncclTopoNodeSet nodes[NCCL_TOPO_NODE_TYPES]; // NCCL_TOPO_NODE_TYPES=7
   float maxBw;
   float totalBw;
 };

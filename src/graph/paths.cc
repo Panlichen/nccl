@@ -21,6 +21,8 @@ struct ncclTopoNodeList {
 static ncclResult_t getPath(struct ncclTopoSystem* system, struct ncclTopoNode* node, int t, int64_t id, struct ncclTopoLinkList** path) {
   for (int i=0; i<system->nodes[t].count; i++) {
     if (system->nodes[t].nodes[i].id == id) {
+      // 这里应该是找到坑，把path指向这个坑，然后返回
+      // 这里这个坑是ncclCalloc分配出来的，总的坑数是 system->nodes[t].count
       *path = node->paths[t]+i;
       return ncclSuccess;
     }
@@ -29,10 +31,17 @@ static ncclResult_t getPath(struct ncclTopoSystem* system, struct ncclTopoNode* 
   return ncclInternalError;
 }
 
+// NCCL_NVB_DISABLE: Disable intra-node communication through NVLink via an intermediate GPU.
+// 所以B是bridge？意思中间桥接一下？这不是 indrect 吗。。之前在阿里学习到的，
+// 有可能是这个：Add support for one hop communication through NVLink, for faster send/recv communication on cubemesh topologies like DGX-1. 加在拓扑里的 p2p intermediateRank
 NCCL_PARAM(NvbDisable, "NVB_DISABLE", 0);
 
+// 这个函数的作用, 是找到所有和 baseNode 能连通的 node 到 baseNode 的路径, 并且把路径放到相应 node->paths[baseNode->type][baseNode->id] 里, 如果有多条路径, 保留 bw 最大的那条.
+// 疑问: 这里处理的跨机的路径了吗??? 多机的设备树是不是可以一起生成???----应该是处理了.
 static ncclResult_t ncclTopoSetPaths(struct ncclTopoNode* baseNode, struct ncclTopoSystem* system) {
   if (baseNode->paths[baseNode->type] == NULL) {
+    // ncclCalloc是模板函数，第一个参数是T**，第二个参数是count，分配 count * sizeof(T) 的内存。这里T是 ncclTopoLinkList
+    // 相当于对每个type，给当前节点分配了 system->nodes[baseNode->type].count （整个系统中该 type 的设备数） 个 ncclTopoLinkList
     NCCLCHECK(ncclCalloc(baseNode->paths+baseNode->type, system->nodes[baseNode->type].count));
   }
 
@@ -42,7 +51,10 @@ static ncclResult_t ncclTopoSetPaths(struct ncclTopoNode* baseNode, struct ncclT
   nodeList.count = 1; nodeList.list[0] = baseNode;
   nextNodeList.count = 0;
   struct ncclTopoLinkList* basePath;
+
+  // 所谓的getPath其实就是找到要放路径的坑，还没有计算。
   NCCLCHECK(getPath(system, baseNode, baseNode->type, baseNode->id, &basePath));
+  
   basePath->count = 0;
   basePath->bw = LOC_BW;
   basePath->type = PATH_LOC;
@@ -54,23 +66,32 @@ static ncclResult_t ncclTopoSetPaths(struct ncclTopoNode* baseNode, struct ncclT
       struct ncclTopoLinkList* path;
       NCCLCHECK(getPath(system, node, baseNode->type, baseNode->id, &path));
       for (int l=0; l<node->nlinks; l++) {
+
+        // 这个link应该是上一步得到设备树的时候得到的“一跳”的link。
         struct ncclTopoLink* link = node->links+l;
         struct ncclTopoNode* remNode = link->remNode;
+
+        // 为了占 remNode 里的坑，先分配好空间
         if (remNode->paths[baseNode->type] == NULL) {
           NCCLCHECK(ncclCalloc(remNode->paths+baseNode->type, system->nodes[baseNode->type].count));
         }
         struct ncclTopoLinkList* remPath;
         NCCLCHECK(getPath(system, remNode, baseNode->type, baseNode->id, &remPath));
+
+        // 初始化的时候, path->bw = LOC_BW, 这里是5000GB/s
         float bw = std::min(path->bw, link->bw);
 
         // allow routing through a GPU only as 1 hop
         if (node != baseNode && node->type == GPU &&
             (ncclParamNvbDisable() || link->type != LINK_NVL || remNode->type != GPU || path->count > 1)) continue;
 
+        // 如果有多条路径, 保留 bw 最大的那条.
         if ((remPath->bw == 0 || remPath->count > path->count) && remPath->bw < bw) {
           // Find reverse link
           for (int l=0; l<remNode->nlinks; l++) {
             if (remNode->links[l].remNode == node) {
+              // 这里把 remPath->list[0] 这个 0 号元素设置为从 remNode 出发的第一跳, 所以各个 node 的 paths[t][i] 存储的是从该 node 出发, 到 system->nodes[t].nodes[i] 的路径
+              // 这个路径唯一吗? 基于这样的路径怎么实现使用多个网卡? 
               remPath->list[0] = remNode->links+l;
               break;
             }
@@ -80,7 +101,10 @@ static ncclResult_t ncclTopoSetPaths(struct ncclTopoNode* baseNode, struct ncclT
                  remNode->type, remNode->id, remNode->nlinks, node->type, node->id);
             return ncclInternalError;
           }
+
           // Copy the rest of the path
+          // 理解这段代码, 看一下 remPath 和 path 这两个坑是咋来的: getPath 调用时候，传入的 id 一直是 baseNode->id, 坑的位置都在新遇到的 node 里，所以这个 path 坑(*path = node->paths[t]+i;)应该指的是从 目前遇到的新 node 走到 baseNode 的路径。
+          // 这里对每个 node 应该是使用了 二维编码，不是所有节点拉平从小到大编号，而是先分到各个 type 里，然后里边再按照 id 从小到大编号.
           for (int i=0; i<path->count; i++) remPath->list[i+1] = path->list[i];
           remPath->count = path->count + 1;
           remPath->bw = bw;
@@ -99,6 +123,8 @@ static ncclResult_t ncclTopoSetPaths(struct ncclTopoNode* baseNode, struct ncclT
 
           // Add to the list for the next iteration if not already in the list
           int i;
+          // break 的是 for (int l=0; l<node->nlinks; l++), 也就是对当前 nodeList 中遍历到的 node 的邻接 node 的处理
+          // 这里 break 的意思是, 要是遇到了已经在 nextNodeList 里的 node, 那当前这个 node 的其他邻接 node 也就不需要再处理了. 不是特别理解. 可能和设备树的处理有关, 保证了这样的 break 不会遗漏节点.
           for (i=0; i<nextNodeList.count; i++) if (nextNodeList.list[i] == remNode) break;
           if (i == nextNodeList.count) nextNodeList.list[nextNodeList.count++] = remNode;
         }

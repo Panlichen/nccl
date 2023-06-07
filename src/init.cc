@@ -16,6 +16,7 @@
 #include "enqueue.h"
 #include "graph.h"
 #include "argcheck.h"
+#include <cstdio>
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
@@ -706,23 +707,41 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   int rank = comm->rank;
   int nranks = comm->nRanks;
   cpu_set_t affinitySave;
+
+  // 一开始建立了很多graph, 所以可能ring、tree是不会复用channel的
   struct ncclTopoGraph ringGraph;
   struct ncclTopoGraph treeGraph;
   struct ncclTopoGraph collNetGraph;
+  // nvls: NVLink SHARP
   struct ncclTopoGraph nvlsGraph;
   struct ncclTopoGraph* graphs[] = { &treeGraph, &ringGraph, &collNetGraph, &collNetGraph, &nvlsGraph, &nvlsGraph };
 
   struct graphInfo {
     int pattern;
-    int nChannels;
+    int nChannels; // 每种graph维护自己的channel
     int sameChannels;
+    
+    // 记录性能数据: 
     float bwIntra;
     float bwInter;
+    
     int typeIntra;
     int typeInter;
   };
 
+  // struct ncclTopoRanks {
+  //   int ringRecv[MAXCHANNELS]; // MAXCHANNELS=32
+  //   int ringSend[MAXCHANNELS];
+  //   int ringPrev[MAXCHANNELS];
+  //   int ringNext[MAXCHANNELS];
+  //   int treeToParent[MAXCHANNELS];
+  //   int treeToChild0[MAXCHANNELS];
+  //   int treeToChild1[MAXCHANNELS];
+  //   int nvlsHeads[MAXCHANNELS];
+  // };
+
   struct allGatherInfo {
+    // NCCL_NUM_ALGORITHMS=6, ring tree, collnet类型的共4种
     struct graphInfo graphInfo[NCCL_NUM_ALGORITHMS];
     struct ncclTopoRanks topoRanks;
   };
@@ -733,13 +752,17 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   int *nodesFirstRank = NULL, *nodesTreePatterns = NULL;
   int *rings = NULL;
   int* nvbPeers = NULL;
+
+  // 不太清楚这里的proxy具体指什么
   struct ncclProxyConnector proxyConn;
   int* pxnPeers = NULL;
   int *topParentLocalRanks = NULL;
   int tpProxyRank;
 
   // AllGather1 - begin
+  // 1. { peerInfo, comm, compCap}，就是些很基础的硬件信息。
   NCCLCHECKGOTO(ncclCalloc(&comm->peerInfo, nranks+1), ret, fail); // Extra rank to represent CollNet root
+  // 这里设置了comm->peerInfo+rank里的成员变量: rank, hostHash, PidHash, shmDev, busId, comm, compCap
   NCCLCHECKGOTO(fillInfo(comm, comm->peerInfo+rank, comm->commHash), ret, fail);
   NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, comm->peerInfo, sizeof(struct ncclPeerInfo)), ret, fail);
 
@@ -755,13 +778,16 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   do {
     // Compute intra-process ranks
     int intraProcRank0 = -1, intraProcRank = -1, intraProcRanks = 0;
+    // CompCap: 可能是 compute capability 算力吧。但是下边这两行代码，似乎循环并没有任何作用。
     for (int i = 0; i < nranks; i++) comm->minCompCap = std::min(comm->minCompCap, comm->peerInfo[rank].cudaCompCap);
     for (int i = 0; i < nranks; i++) comm->maxCompCap = std::max(comm->maxCompCap, comm->peerInfo[rank].cudaCompCap);
+    // rank = comm->rank，应该是当前设备的rank。下边遍历i，是其他设备，所以需要找到 i!=rank, 但是满足 hostHash, pidHash 相同的设备，才认为是同一个进程内的设备。
     for (int i = 0; i < nranks; i++) {
       if ((comm->peerInfo[i].hostHash == comm->peerInfo[rank].hostHash)
           && (comm->peerInfo[i].pidHash == comm->peerInfo[rank].pidHash)) {
         // Rank is in same process
         if (intraProcRanks == 0) intraProcRank0 = i;
+        // 找到自己在进程内的位置。
         if (i == rank) intraProcRank = intraProcRanks;
         intraProcRanks++;
         if (intraProcRank0 == rank && rank != i) {
@@ -781,6 +807,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     }
     struct ncclComm* comm0 = comm->peerInfo[intraProcRank0].comm;
     assert(intraProcRank==0 ? comm==comm0 : true);
+    // comm->intra*
     comm->intraComm0 = comm0;
     comm->intraRank = intraProcRank;
     comm->intraRanks = intraProcRanks;
@@ -790,14 +817,95 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   } while(0);
 
   // Topo detection / System graph creation
+  // struct ncclTopoLink {
+  //   int type;
+  //   float bw;
+  //   struct ncclTopoNode* remNode;
+  // };
+  // #define NCCL_TOPO_MAX_LINKS 32
+  // #define NCCL_TOPO_MAX_HOPS (NCCL_TOPO_MAX_NODES*NCCL_TOPO_NODE_TYPES)
+
+  // struct ncclTopoLinkList {
+  //   struct ncclTopoLink* list[NCCL_TOPO_MAX_HOPS];
+  //   int count;
+  //   float bw;
+  //   int type;
+  // };
+
+  // #define NCCL_TOPO_CPU_INTEL_BDW 1
+  // #define NCCL_TOPO_CPU_INTEL_SKL 2
+
+  // #define NCCL_TOPO_UNDEF (-1)
+
+  // struct ncclTopoNode {
+  //   int type;
+  //   int64_t id;
+  //   // Type specific data
+  //   union {
+  //     struct {
+  //       int dev; // NVML dev number
+  //       int rank;
+  //       int cudaCompCap;
+  //       int gdrSupport;
+  //     }gpu;
+  //     struct {
+  //       uint64_t asic;
+  //       int port;
+  //       float bw;
+  //       float latency;
+  //       int gdrSupport;
+  //       int collSupport;
+  //       int maxChannels;
+  //     }net;
+  //     struct {
+  //       int arch;
+  //       int vendor;
+  //       int model;
+  //       cpu_set_t affinity;
+  //     }cpu;
+  //     struct {
+  //       uint64_t device;
+  //     }pci;
+  //   };
+  //   int nlinks;
+  //   struct ncclTopoLink links[NCCL_TOPO_MAX_LINKS];
+
+  //   // Pre-computed paths to GPUs and NICs
+  //   struct ncclTopoLinkList* paths[NCCL_TOPO_NODE_TYPES];
+
+  //   // Used during search
+  //   uint64_t used;
+  // };
+
+  // struct ncclTopoNodeSet {
+  //   int count;
+  //   struct ncclTopoNode nodes[NCCL_TOPO_MAX_NODES]; // NCCL_TOPO_MAX_NODES=256
+  // };
+
+  // struct ncclTopoSystem {
+  //   struct ncclTopoNodeSet nodes[NCCL_TOPO_NODE_TYPES]; // NCCL_TOPO_NODE_TYPES=7
+  //   float maxBw;
+  //   float totalBw;
+  // };
+  
+  // 将当前rank的PCI树建立起来，每个rank都能看到完整的，一样的，最终保留的和nvidia-smi topo -m 看到的一样
+  // 分为两个步骤，先使用xml表示整个PCI树结构，然后基于xml转成 ncclTopoNode, 以及最终的 ncclTopoSystem, 即 comm->topo
   NCCLCHECKGOTO(ncclTopoGetSystem(comm, &comm->topo), ret, fail);
+
+  //  ******************
+  // 通过打印的情况看, 多机通过MPI启动的时候, 设备树以及拓扑的 path 都只包含了本地的设备, 没有包含远程的设备
+  //  ******************
+
   // Compute paths between GPUs and NICs
+  // 计算GPU和NIC节点到其他任意节点之间的 bw 最大的路径
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
+
   // Remove inaccessible GPUs and unused NICs
   NCCLCHECKGOTO(ncclTopoTrimSystem(comm->topo, comm), ret, fail);
   // Recompute paths after trimming
   NCCLCHECKGOTO(ncclTopoComputePaths(comm->topo, comm), ret, fail);
-  // Init search
+
+  // Init search 
   NCCLCHECKGOTO(ncclTopoSearchInit(comm->topo), ret, fail);
   // Print final topology
   NCCLCHECKGOTO(ncclTopoPrint(comm->topo), ret, fail);
@@ -824,6 +932,38 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   // Determine local Nvls support
   NCCLCHECK(ncclNvlsInit(comm));
 
+
+  // #define NCCL_TOPO_PATTERN_BALANCED_TREE 1   // Spread NIC traffic between two GPUs (Tree parent + one child on first GPU, second child on second GPU)
+  // #define NCCL_TOPO_PATTERN_SPLIT_TREE 2      // Spread NIC traffic between two GPUs (Tree parent on first GPU, tree children on the second GPU)
+  // #define NCCL_TOPO_PATTERN_TREE 3            // All NIC traffic going to/from the same GPU
+  // #define NCCL_TOPO_PATTERN_RING 4            // Ring
+  // #define NCCL_TOPO_PATTERN_NVLS 5            // NVLS+SHARP and NVLS+Tree
+
+
+  // struct ncclTopoGraph {
+  //   // Input / output
+  //   int id; // ring : 0, tree : 1, collnet : 2
+  //   int pattern;
+  //   int crossNic;
+  //   int collNet;
+  //   int minChannels;
+  //   int maxChannels;
+  //   // Output
+  //   int nChannels;
+  //   float bwIntra;
+  //   float bwInter;
+  //   float latencyInter;
+  //   int typeIntra;
+  //   int typeInter;
+  //   int sameChannels;
+  //   int nHops;
+  //   // MAXCHANNELS 32
+  //   // NCCL_TOPO_MAX_NODES 256
+  //   int intra[MAXCHANNELS*NCCL_TOPO_MAX_NODES];
+  //   int inter[MAXCHANNELS*2];
+  // };
+
+
   // Get rings and trees
   ringGraph.id = 0;
   ringGraph.pattern = NCCL_TOPO_PATTERN_RING;
@@ -834,6 +974,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   NCCLCHECKGOTO(ncclTopoPrintGraph(comm->topo, &ringGraph), ret, fail);
 
   treeGraph.id = 1;
+  // 直接代码写死的, 也就是说, 一定是 balanced tree
   treeGraph.pattern = NCCL_TOPO_PATTERN_BALANCED_TREE;
   treeGraph.collNet = 0;
   treeGraph.minChannels = ringGraph.nChannels;
@@ -872,9 +1013,14 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     NCCLCHECKGOTO(ncclTopoDumpGraphs(comm->topo, 4, dumpGraphs), ret, fail);
   }
 
+  // *************************
+  // 上边得到一个比较原始的 graph, 注意到在27, 25上, 都只有一个 channel, 囊括了所有的设备.
+  // *************************
+
   // AllGather3 - begin
   NCCLCHECKGOTO(ncclCalloc(&allGather3Data, nranks), ret, fail);
 
+  // graphInfo 只保留了 ncclTopoGraph 中 7 个成员, 注意到里边没有保留具体的设备信息, 即没有保留 intra, inter 数组.
   for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
     allGather3Data[rank].graphInfo[a].pattern = graphs[a]->pattern;
     allGather3Data[rank].graphInfo[a].nChannels = graphs[a]->nChannels;
@@ -885,9 +1031,29 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     allGather3Data[rank].graphInfo[a].typeInter = graphs[a]->typeInter;
   }
 
+  // struct ncclTopoRanks {
+  //   int ringRecv[MAXCHANNELS];
+  //   int ringSend[MAXCHANNELS];
+  //   int ringPrev[MAXCHANNELS];
+  //   int ringNext[MAXCHANNELS];
+
+  //   int treeToParent[MAXCHANNELS];
+  //   int treeToChild0[MAXCHANNELS];
+  //   int treeToChild1[MAXCHANNELS];
+
+  //   int nvlsHeads[MAXCHANNELS];
+  // };
+
   comm->nChannels = std::min(treeGraph.nChannels, ringGraph.nChannels);
+
+  // *************************
+  // 这个函数的主要作用, 是按照 ncclTopoGraph 里记录的内容, 初始化 comm->channels 里的内容, 比较关键的是填充了 channel->ring.prev, channel->ring.next 等内容.
+  // 还有个很值得注意的地方是, 填充了 allGather3Data[rank].topoRanks->ringRecv[0] 和 allGather3Data[rank].topoRanks->ringSend[0] (tree, collNet等应该是类似的), 赋的值用的是来自 comm 的 global rank, 相当于标记了一个节点的出口和入口, 这样的话, 在后续的 allGather3 中, 就可以知道每个节点的出口和入口了, 就可以填充跨节点的拓扑路径了.
+  // 注意到最后复制加倍了 comm->channels 里的内容, 但是 comm->nChannels 没有改变.
+  // *************************
   NCCLCHECKGOTO(ncclTopoPreset(comm, graphs, &allGather3Data[rank].topoRanks), ret, fail);
 
+  // 
   NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allGather3Data, sizeof(*allGather3Data)), ret, fail);
 
   // Determine nNodes, firstRanks, ...
@@ -958,6 +1124,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   }
 
   comm->nChannels = treeGraph.nChannels = ringGraph.nChannels = std::min(treeGraph.nChannels, ringGraph.nChannels);
+  // printf("Using %d out of %d possible channels\n", comm->nChannels, nChannelsOrig);
+  // 这个时候 comm->nChannels = 1, nChannelsOrig = 1
   if (comm->nChannels < nChannelsOrig) {
     // We started duplicating channels during Preset(), so we need to move the
     // duplicated channels since we have removed some.
@@ -981,10 +1149,16 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   }
 
   NCCLCHECKGOTO(ncclCalloc(&rings, nranks*MAXCHANNELS), ret, fail);
+  // printf("Using %d out of %d possible channels\n", comm->nChannels, nChannelsOrig); // 这个时候 comm->nChannels = 1, nChannelsOrig = 1
+  // 在这里发生了 comm->nChannels 的增加.
+  // *********************************
+  // 这里和上边的 ncclTopoPreset 对应, 基于 allGather 之后的结果, 可以实现跨节点的拓扑连接了, 比如对 ring 来说, 知道了下一个 node 的 recv 和 send 分别是谁, 这样就可以连接完整的跨node的环, 下边在打印环的时候, 就可以看到"node 边缘的 rank" 的 prev 和 next 中有一个跨node的了.
+  // *********************************
   NCCLCHECKGOTO(ncclTopoPostset(comm, nodesFirstRank, nodesTreePatterns, allTopoRanks, rings, graphs), ret, fail);
   // AllGather3 - end
 
   TRACE(NCCL_INIT, "rank %d nranks %d - BUILT %d TREES/RINGS", rank, nranks, comm->nChannels);
+  INFO(NCCL_INIT, "rank %d nranks %d - BUILT %d TREES/RINGS", rank, nranks, comm->nChannels);
 
   char line[1024];
   line[0]='\0';
@@ -1019,9 +1193,19 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   }
   comm->topParentLocalRanks = topParentLocalRanks;
 
+  // *********************************
+  // 这是启动网卡的 proxy 的线程, 之前跨机的时候仔细研究过.
+  // *********************************
   // Launch proxy service thread, after this, the proxy calls can be used.
   NCCLCHECKGOTO(ncclProxyCreate(comm), ret, fail);
 
+  // *********************************
+  // 再往下就是连接transport, 之前大致研究过, 还是这几种:
+  // extern struct ncclTransport p2pTransport;
+  // extern struct ncclTransport shmTransport;
+  // extern struct ncclTransport netTransport;
+  // extern struct ncclTransport collNetTransport;
+  // *********************************
   // Connect with prev/next for each ring
   for (int c=0; c<comm->nChannels; c++) {
     struct ncclChannel* channel = comm->channels+c;
@@ -1268,7 +1452,7 @@ fail:
 }
 
 static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
-  struct ncclCommInitRankAsyncJob* job = (struct ncclCommInitRankAsyncJob*)job_;
+  struct ncclCommInitRankAsyncJob* job = (struct ncclCommInitRankAsyncJob*)job_; // 去吃屎吧你们。
   ncclComm_t comm = job->comm;
   ncclResult_t res = ncclSuccess;
   int archMajor, archMinor;
@@ -1281,8 +1465,10 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   CUDACHECKGOTO(cudaDeviceGetAttribute(&archMajor, cudaDevAttrComputeCapabilityMajor, cudaDev), res, fail);
   CUDACHECKGOTO(cudaDeviceGetAttribute(&archMinor, cudaDevAttrComputeCapabilityMinor, cudaDev), res, fail);
   cudaArch = 100*archMajor + 10*archMinor;
+  // 27上, 打印出来 cudaArch = 860
+  // printf("cudaArch = %d\n", cudaArch);
 
-  NCCLCHECK(ncclInitKernelsForDevice(cudaArch, &maxLocalSizeBytes));
+  NCCLCHECK(ncclInitKernelsForDevice(cudaArch, &maxLocalSizeBytes)); // Returns maximum kernel stack size of all CUDA kernels
   // Set the maximum kernel stack size of all kernels to avoid
   // a CUDA memory reconfig on load (c.f. NVSHMEM issue)
   if (maxLocalSizeBytes > 0 && ncclParamSetStackSize() == 1) {
@@ -1300,7 +1486,8 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     NCCLCHECKGOTO(bootstrapSplit((struct ncclBootstrapHandle*)&job->commId, comm, job->parent, job->color, job->key, parentRanks), res, fail);
   } else {
     NCCLCHECKGOTO(commAlloc(comm, NULL, job->nranks, job->myrank), res, fail);
-    NCCLCHECKGOTO(bootstrapInit((struct ncclBootstrapHandle*)&job->commId, comm), res, fail);
+
+    NCCLCHECKGOTO(bootstrapInit((struct ncclBootstrapHandle*)&job->commId, comm), res, fail); // 利用all-gather收集了handle里的socket信息。// 这丧心病狂的设计, 指针转换, 居然把handle当成了commId。
   }
 
   comm->cudaArch = cudaArch;
@@ -1584,6 +1771,7 @@ ncclResult_t ncclCommInitRank(ncclComm_t* newcomm, int nranks, ncclUniqueId comm
   NvtxParamsCommInitRank payload{myrank, nranks, cudaDev};
   NVTX3_FUNC_WITH_PARAMS(CommInitRank, CommInitRankSchema, payload)
 
+  // 这里的参数比较好理解, 调用者需要提供一个uniqueId, 和我们的使用的印象是一致的。
   NCCLCHECK(ncclCommInitRankDev(newcomm, nranks, commId, myrank, cudaDev, &config));
   return ncclSuccess;
 }

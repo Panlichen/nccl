@@ -188,6 +188,7 @@ __device__ void ncclKernel(
     if (ncclShmem.work.header.funcIndex == FnIndex) {
       RunWork<Fn, T, RedOp, Algo, Proto>().run(&ncclShmem.work);
     } else {
+      // 通过 ncclFuncs 再跳转一次.
       ncclFuncs[ncclShmem.work.header.funcIndex]();
     }
 

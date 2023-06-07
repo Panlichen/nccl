@@ -8,6 +8,7 @@
 #include "graph.h"
 #include "topo.h"
 #include "xml.h"
+#include <cstdio>
 #include <math.h>
 
 NCCL_PARAM(CrossNic, "CROSS_NIC", 2);
@@ -358,6 +359,8 @@ ncclResult_t ncclTopoCompareGraphs(struct ncclTopoSystem* system, struct ncclTop
 //    based on the GPU NVML index so that e.g. GPU 1 chooses NIC 1 first instead of NIC 0 which
 //    might have been choosen by GPU 0 (case with multiple independent communicators per node)
 // 3. Then add the NETs to the final list if they were not already added by another closer GPU.
+
+// NVML 就是个监控的工具, nvidia-smi 也是基于 NVML 的
 
 ncclResult_t ncclTopoSelectNets(struct ncclTopoSystem* system, int typeInter, int gpu, int* nets, int* netCountRet) {
   int netCount = 0;
@@ -785,6 +788,9 @@ float sm90SpeedArrayInter[] = { 48.0, 45.0, 42.0, 40.0, 30.0, 24.0, 15.0, 12.0, 
 
 ncclResult_t ncclTopoCompute(ncclTopoSystem* system, struct ncclTopoGraph* graph) {
   int ngpus = system->nodes[GPU].count;
+
+  // printf("#GPU : %d, #NET : %d\n", ngpus, system->nodes[NET].count);
+
   graph->crossNic = ncclParamCrossNic();
   int crossNic = (system->nodes[NET].count > 1) && graph->crossNic &&
 	 (graph->pattern == NCCL_TOPO_PATTERN_RING ||
@@ -796,9 +802,12 @@ ncclResult_t ncclTopoCompute(ncclTopoSystem* system, struct ncclTopoGraph* graph
   graph->typeIntra = ngpus == 1 ? PATH_LOC : PATH_NVL;
   graph->typeInter = PATH_PIX;
   graph->nChannels = 0;
+
+  // 不是NCCL_TOPO_PATTERN_NVLS的时候, 就尝试使用相同的channel
   int trySameChannels = graph->pattern == NCCL_TOPO_PATTERN_NVLS ? 0 : 1;
   graph->sameChannels = trySameChannels;
 
+  // 可以通过环境变量 NCCL_GRAPH_FILE 来指定 graph 的结构
   char* str = getenv("NCCL_GRAPH_FILE");
   if (str) {
     INFO(NCCL_ENV, "NCCL_GRAPH_FILE set by environment to %s", str);
@@ -812,8 +821,11 @@ ncclResult_t ncclTopoCompute(ncclTopoSystem* system, struct ncclTopoGraph* graph
     if (graph->nChannels > 0) return ncclSuccess;
   }
 
+  // 所谓的 compute capacity 其实就是编译的时候用的 sm_XX
   int ccMin;
   NCCLCHECK(ncclTopoGetCompCap(system, &ccMin, NULL));
+  // printf("ccMin : %d\n", ccMin);
+
   if (graph->pattern == NCCL_TOPO_PATTERN_NVLS && (system->nodes[NVS].count == 0 || ccMin < 90)) return ncclSuccess;
 
   if (ngpus == 1) if (graph->pattern != NCCL_TOPO_PATTERN_RING) graph->pattern = NCCL_TOPO_PATTERN_TREE;
@@ -850,6 +862,10 @@ search:
   tmpGraph.nChannels = 0;
   globalTimeout -= time;
 
+  // ******************************************************************************************
+  // 这个是最关键的. 通过调用 ncclTopoSearchRec 来搜索最优的拓扑结构
+  // 如果有网卡, 就用 ncclTopoSearchRecNet 从 net 节点开始搜索, 否则用 ncclTopoSearchRecGpu 从 gpu 节点开始搜索
+  // ******************************************************************************************
   NCCLCHECK(ncclTopoSearchRec(system, &tmpGraph, graph, &time));
 #if 0
   printf("Pattern %d, crossNic %d, Bw %g/%g, type %d/%d, channels %d-%d sameChannels %d -> nChannels %dx%g/%g %s\n", tmpGraph.pattern, tmpGraph.crossNic, tmpGraph.bwInter, tmpGraph.bwIntra, tmpGraph.typeInter, tmpGraph.typeIntra, tmpGraph.minChannels, tmpGraph.maxChannels, tmpGraph.sameChannels, graph->nChannels, graph->bwInter, graph->bwIntra, time == 0 ? "TIMEOUT" : time == -1 ? "PERFECT" : "");
@@ -964,6 +980,7 @@ done:
 
 ncclResult_t ncclTopoPrintGraph(struct ncclTopoSystem* system, struct ncclTopoGraph* graph) {
   INFO(NCCL_GRAPH, "Pattern %d, crossNic %d, nChannels %d, bw %f/%f, type %s/%s, sameChannels %d", graph->pattern, graph->crossNic, graph->nChannels, graph->bwIntra, graph->bwInter, topoPathTypeStr[graph->typeIntra], topoPathTypeStr[graph->typeInter], graph->sameChannels);
+  // INFO(NCCL_GRAPH, "graph.id %d, Pattern %d, crossNic %d, nChannels %d, bw %f/%f, type %s/%s, sameChannels %d", graph->id, graph->pattern, graph->crossNic, graph->nChannels, graph->bwIntra, graph->bwInter, topoPathTypeStr[graph->typeIntra], topoPathTypeStr[graph->typeInter], graph->sameChannels);
   int ngpus = system->nodes[GPU].count;
 
   char line[1024];
@@ -975,6 +992,7 @@ ncclResult_t ncclTopoPrintGraph(struct ncclTopoSystem* system, struct ncclTopoGr
       offset = strlen(line);
     }
     for (int i=0; i<ngpus; i++) {
+      // graph->intra[ngpus*c+i] 的写法像一个二维数组.
       sprintf(line+offset, " %s/%d", topoNodeTypeStr[GPU], graph->intra[ngpus*c+i]);
       offset = strlen(line);
     }

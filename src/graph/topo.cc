@@ -11,6 +11,7 @@
 #include "nvmlwrap.h"
 #include "net.h"
 #include "coll_net.h"
+#include <cstdio>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include "xml.h"
@@ -673,6 +674,7 @@ ncclResult_t ncclTopoGetSystem(struct ncclComm* comm, struct ncclTopoSystem** sy
     INFO(NCCL_ENV, "NCCL_TOPO_DUMP_FILE set by environment to %s", xmlTopoFile);
     NCCLCHECK(ncclTopoDumpXmlToFile(xmlTopoFile, xml));
   }
+  // printf("NCCL_TOPO_DUMP_FILE set by environment to %s", xmlTopoFile);
 
   NCCLCHECK(ncclTopoGetSystemFromXml(xml, system));
   free(xml);

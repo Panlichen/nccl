@@ -86,6 +86,8 @@ struct ncclTopoGraph {
   int typeInter;
   int sameChannels;
   int nHops;
+  // MAXCHANNELS 32
+  // NCCL_TOPO_MAX_NODES 256
   int intra[MAXCHANNELS*NCCL_TOPO_MAX_NODES];
   int inter[MAXCHANNELS*2];
 };

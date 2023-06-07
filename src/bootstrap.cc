@@ -225,6 +225,9 @@ struct bootstrapState {
   volatile uint32_t *abortFlag;
 };
 
+// 所有人和root通信，然后建立起一个环，利用这个环进行两次AllGather。
+// 这里前后应该是涉及三类socket：第一是和root通信的临时的： sock, listenSockRoot ；第二是创建出来的ring中的socket： state->ringSendSocket, state->ringRecvSocket ；第三类是利用这个ring进行AllGather来同步的socket： state->peerCommAddresses, state->peerProxyAddresses
+// 感觉好像有点多余，不过应该是有人家的道理。
 ncclResult_t bootstrapInit(struct ncclBootstrapHandle* handle, struct ncclComm* comm) {
   int rank = comm->rank;
   int nranks = comm->nRanks;
@@ -245,12 +248,12 @@ ncclResult_t bootstrapInit(struct ncclBootstrapHandle* handle, struct ncclComm* 
 
   info.rank = rank;
   info.nranks = nranks;
-  // Create socket for other ranks to contact me
+  // Create socket for **other ranks** to contact me
   NCCLCHECK(ncclSocketInit(&state->listenSock, &bootstrapNetIfAddr, comm->magic, ncclSocketTypeBootstrap, comm->abortFlag));
-  NCCLCHECK(ncclSocketListen(&state->listenSock));
+  NCCLCHECK(ncclSocketListen(&state->listenSock)); // listen函数的主要任务是将socket转换为被动模式，以接受来自客户端的连接请求。c语言listen的第二个参数是在队列中等待的连接数。如果这个值设得过小，可能会在多个客户端同时连接时导致连接失败。 // accept函数是阻塞的，它会等待直到有客户端连接。如果你不希望它阻塞，你可以设置socket为非阻塞模式，或者使用select或poll等函数来进行异步IO。// 客户端用connect等函数来主动发起连接。
   NCCLCHECK(ncclSocketGetAddr(&state->listenSock, &info.extAddressListen));
 
-  // Create socket for root to contact me
+  // Create socket for **root** to contact me
   NCCLCHECK(ncclSocketInit(&listenSockRoot, &bootstrapNetIfAddr, comm->magic, ncclSocketTypeBootstrap, comm->abortFlag));
   NCCLCHECK(ncclSocketListen(&listenSockRoot));
   NCCLCHECK(ncclSocketGetAddr(&listenSockRoot, &info.extAddressListenRoot));
@@ -265,7 +268,7 @@ ncclResult_t bootstrapInit(struct ncclBootstrapHandle* handle, struct ncclComm* 
     (void) nanosleep(&tv, NULL);
   }
 
-  // send info on my listening socket to root
+  // send info on my listening socket to root // root的信息是ncclCommInitRankFunc传进来的。
   NCCLCHECK(ncclSocketInit(&sock, &handle->addr, comm->magic, ncclSocketTypeBootstrap, comm->abortFlag));
   NCCLCHECK(ncclSocketConnect(&sock));
   NCCLCHECK(bootstrapNetSend(&sock, &info, sizeof(info)));
@@ -278,6 +281,7 @@ ncclResult_t bootstrapInit(struct ncclBootstrapHandle* handle, struct ncclComm* 
   NCCLCHECK(ncclSocketClose(&sock));
   NCCLCHECK(ncclSocketClose(&listenSockRoot));
 
+  // 这里向下游发起连接请求，然后接受上游的连接请求。建立起了环。
   NCCLCHECK(ncclSocketInit(&state->ringSendSocket, &nextAddr, comm->magic, ncclSocketTypeBootstrap, comm->abortFlag));
   NCCLCHECK(ncclSocketConnect(&state->ringSendSocket));
   // Accept the connect request from the previous rank in the AllGather ring
@@ -286,8 +290,8 @@ ncclResult_t bootstrapInit(struct ncclBootstrapHandle* handle, struct ncclComm* 
 
   // AllGather all listen handlers
   NCCLCHECK(ncclCalloc(&state->peerCommAddresses, nranks));
-  NCCLCHECK(ncclSocketGetAddr(&state->listenSock, state->peerCommAddresses+rank));
-  NCCLCHECK(bootstrapAllGather(state, state->peerCommAddresses, sizeof(union ncclSocketAddress)));
+  NCCLCHECK(ncclSocketGetAddr(&state->listenSock, state->peerCommAddresses+rank)); // 这里是把&state->listenSock->addr放到了state->peerCommAddresses+rank中。
+  NCCLCHECK(bootstrapAllGather(state, state->peerCommAddresses, sizeof(union ncclSocketAddress))); // 把所有人的 state->peerCommAddresses 集合了起来。
 
   // Create the service proxy
   NCCLCHECK(ncclCalloc(&state->peerProxyAddresses, nranks));
@@ -296,8 +300,9 @@ ncclResult_t bootstrapInit(struct ncclBootstrapHandle* handle, struct ncclComm* 
   NCCLCHECK(ncclCalloc(&proxySocket, 1));
   NCCLCHECK(ncclSocketInit(proxySocket, &bootstrapNetIfAddr, comm->magic, ncclSocketTypeProxy, comm->abortFlag));
   NCCLCHECK(ncclSocketListen(proxySocket));
-  NCCLCHECK(ncclSocketGetAddr(proxySocket, state->peerProxyAddresses+rank));
-  NCCLCHECK(bootstrapAllGather(state, state->peerProxyAddresses, sizeof(union ncclSocketAddress)));
+  NCCLCHECK(ncclSocketGetAddr(proxySocket, state->peerProxyAddresses+rank)); // 这里是把刚刚初始化的proxySocket->addr放到了state->peerProxyAddresses+rank中。
+  NCCLCHECK(bootstrapAllGather(state, state->peerProxyAddresses, sizeof(union ncclSocketAddress))); // 把所有人的 state->peerProxyAddresses 集合了起来。
+  // 注意这里同步了之后，又进行了Proxy的初始化。
   NCCLCHECK(ncclProxyInit(comm, proxySocket, state->peerProxyAddresses));
 
   TRACE(NCCL_INIT, "rank %d nranks %d - DONE", rank, nranks);

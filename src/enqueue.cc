@@ -480,6 +480,7 @@ NCCL_PARAM(GraphRegister, "GRAPH_REGISTER", 0);
 static ncclResult_t getCollNetSupport(struct ncclInfo* info, int* collNetTypeSupport);
 static ncclResult_t getAlgoInfo(struct ncclInfo* info, int collNetTypeSupport, int numPipeOps);
 
+// 这里创建plan, 指定 plan->kernelFn
 static ncclResult_t scheduleCollTasksToPlan(
     struct ncclComm* comm, struct ncclKernelPlan* plan, int* nWorkBudget
   ) {
@@ -590,6 +591,20 @@ static ncclResult_t scheduleCollTasksToPlan(
 
       plan->threadPerBlock = std::max(plan->threadPerBlock, info.nThreads);
       if (!plan->kernelSpecialized) {
+        // 指定了 plan->kernelFn
+        // 也指定了 plan->kernelSpecialized, 参考下边的源码. 这个变量应该是指明了 kernelFn 是否是专门化的, 也就是进到 kernel 执行的时候是否需要再通过 ncclFuncs 再跳转一次.
+
+        // struct ncclKernelMatch {
+        //   void* kernelFn;
+        //   bool specialized;
+        // };
+
+        // // Only generate inline kernels for LL
+        // #define NCCL_FUNC5(func, algo, devredop, dtype, specialized) \
+        //   /*LL    */{(void*)NCCL_KERN_NAME(func, algo, LL, devredop, dtype), true && specialized}, \
+        //   /*LL128 */{(void*)NCCL_KERN_NAME(func, algo, LL, devredop, dtype), false && specialized}, \
+        //   /*SIMPLE*/{(void*)NCCL_KERN_NAME(func, algo, LL, devredop, dtype), false && specialized}
+
         plan->kernelFn = ncclKerns[workFuncIndex].kernelFn;
         plan->kernelSpecialized = ncclKerns[workFuncIndex].specialized;
       }
@@ -1033,6 +1048,7 @@ NCCL_PARAM(MemSyncDomain, "MEM_SYNC_DOMAIN", cudaLaunchMemSyncDomainRemote);
 
 ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   struct ncclTasks* tasks = &comm->tasks;
+  // 找一找怎么确定的这个fn
   void *fn = plan->kernelFn;
   cudaStream_t launchStream = tasks->streams->stream;
   dim3 grid = {(unsigned)plan->channelCount, 1, 1};
@@ -1151,6 +1167,7 @@ static inline ncclResult_t getCollNetSupport(struct ncclInfo* info, int* collNet
   return ncclSuccess;
 }
 
+// 指定了 ncclInfo 里的 algorithm, protocol, 返回之后, 在调用者那里由此计算相应的 kernelFn, 同时也指定需要的 info->nChannels 和 info->nThreads
 // numPipeOps: number of pipelined ops. Can be greater than 1 in aggregation mode. Used to adjust latency.
 static ncclResult_t getAlgoInfo(struct ncclInfo* info, int collNetTypeSupport, int numPipeOps) {
   struct ncclComm* comm = info->comm;
@@ -1173,6 +1190,7 @@ static ncclResult_t getAlgoInfo(struct ncclInfo* info, int collNetTypeSupport, i
       for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
         float time;
         NCCLCHECK(ncclTopoGetAlgoTime(info, a, p, numPipeOps, &time));
+        // 通过假装算一下时间, 判断用什么 algorithm, protocol 最合适.
         if (time >= 0 && time < minTime) {
           info->algorithm = a;
           info->protocol = p;

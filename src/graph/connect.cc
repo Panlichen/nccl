@@ -9,6 +9,7 @@
 #include "trees.h"
 #include "rings.h"
 #include "topo.h"
+#include <cstdio>
 
 /******************************************************************/
 /********************* Internode connection ***********************/
@@ -16,6 +17,7 @@
 
 ncclResult_t ncclTopoPreset(struct ncclComm* comm, struct ncclTopoGraph** graphs, struct ncclTopoRanks* topoRanks) {
   int rank = comm->rank;
+  // 图穷匕见, 明牌拓扑就是本地设备.
   int localRanks = comm->topo->nodes[GPU].count;
   int nChannels = comm->nChannels;
 
@@ -69,6 +71,8 @@ ncclResult_t ncclTopoPreset(struct ncclComm* comm, struct ncclTopoGraph** graphs
   struct ncclChannel* channel0 = comm->channels;
   struct ncclChannel* channel1 = channel0+nChannels;
   memcpy(channel1, channel0, nChannels*sizeof(struct ncclChannel));
+  // printf("comm->nChannels: %d, rank = %d, topoRanks->ringRecv[0] = %d, topoRanks->ringSend[0] = %d\n", comm->nChannels, comm->rank, topoRanks->ringRecv[0], topoRanks->ringSend[0]);
+  // 这里复制之后, comm->nChannels 并没有变大.
   return ncclSuccess;
 }
 
@@ -386,6 +390,7 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   memcpy(ringNext+nChannels*nranks, ringNext, nChannels*nranks*sizeof(int));
 
   // Duplication should be complete now
+  // 最后完成了 channel 的复制, 增加了 comm->nChannels
   nChannels = comm->nChannels = std::min(MAXCHANNELS,nChannels*2);
 
   // Setup CollNet
@@ -416,6 +421,7 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   }
 
   // Create rings array and check all is fine
+  // 检查一下 ring 的合法性.
   NCCLCHECK(ncclBuildRings(nChannels, rings, comm->rank, comm->nRanks, ringPrev, ringNext));
 
   free(ringRecv);
